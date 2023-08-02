@@ -259,7 +259,7 @@ auto_prepend_file=/var/www/codecoverage/loader.php
 
 # Running AnimateDead
 
-AnimateDead requires the source code of target applications for its analysis. The source code of our target web applications are stored under `php/debloating_templates/` and for the start, we can use "DVWA". Download its source from [anonymous] and unzip it.
+AnimateDead requires the source code of target applications for its analysis. The source code of our target web applications are stored under `php/debloating_templates/` and for the start, we can use "DVWA". Download its source from https://github.com/digininja/DVWA and unzip it.
 
 In order to run AnimateDead locally (Single thread, without Message Queue), which is mostly used for debugging purposes, you can run this command from `php/client/` directory:
 
