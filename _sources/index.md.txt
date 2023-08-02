@@ -1,0 +1,302 @@
+# AnimateDead Documents
+
+This document will walk you through the concepts that you need to understand to be able to contribute to the AnimateDead project. This project performs "Concolic Execution" of PHP code using an emulator.
+
+## Brief summary and motivation
+
+Less is More ([https://lessismore.debloating.com/](https://lessismore.debloating.com/)) showed that debloating web applications provides significant security benefits in terms of attack surface reduction (Removed CVEs, broken exploits, smaller applications, etc.)
+
+The main limitation of Less is More is its dependency on dynamic line coverage trace to debloat web applications. Running XDebug in a production environment to collect line coverage information comes with a non-negligible performance overhead. 
+Based on these observations, we came up with the idea of building a "Symbolic Execution Engine" that is capable of exploring feasible paths within PHP applications based on web server log files which are already available on web servers. Based on the code coverage information produced by this emulation engine, we can then debloat web applications.
+
+This enables static debloating of web applications. Moreover, this way of exploring application paths will retain certain useful paths such as error handling code that might be removed by Less is More if the training data did not exercise those paths.
+
+# Modules
+
+This project consists of 3 main modules. Module dependency looks like this:
+
+- **Extended-MalMax:** PHP emulator capable of parsing and running concrete PHP code. Extended to support symbolic variables (variables with unknown value at emulation time.)
+- **AnimateDead:** Wrapper code for Extended-MalMax, translating entry points from Apache log files to executable code for Extended-MalMax (e.g., _GET /login.php?username=bob_ → Run ./WordPress/login.php and populate $_GET\['username'\] with "bob".)
+- **Distributed AnimateDead:** Wrapper around AnimateDead to support distributed and parallel execution of multiple execution paths using a message-queue/worker architecture.
+
+## Extending MalMax
+
+This module was originally published as part of "[MalMax: Multi-Aspect Execution for Automated Dynamic Web Server Malware Analysis](https://www.cs.virginia.edu/~yk2bb/data/malmax_ccs19.pdf)" paper from CCS 2019 conference. The authors of this tool used it to uncover the obfuscation layer of malware injected into WordPress plugins. We are extending this emulator to support more PHP applications as well as to understand and emulate PHP code with Symbolic variables which have unknown value at emulation time.
+
+### Contributions to MalMax
+
+The original copy of MalMax only supported a limited list of PHP features and opcodes, which was enough for its original use case. But since in this project, our goal is not just to focus on the execution of a single PHP file, but rather the whole execution flow from an entry point, we made frequent changes and added a large list of features to original MalMax.
+
+#### Support for symbolic variables
+
+In order to run PHP code with symbolic variables (i.e., variables that we do not know their value), we needed to update the logic inside MalMax. For instance, an `if` condition for which the condition has a symbolic value, cannot determine the execution path. As a result, the execution engine should fork the execution such that both the branch where the condition is "true" and the branch where the condition is "false" are taken and analyzed.
+
+#### Support for missing opcodes
+
+We use [PHP-Parser](https://github.com/nikic/PHP-Parser/) library to get the AST from PHP code. Gradually we added support for all missing PHP opcodes to MalMax. Occasionally we may identify specific use cases of these opcodes that are not supported by MalMax that we have to implement. An example of such task would be a list assignment that ignores the first index:
+
+```php
+list(, $queryString) = explode('?', $_SERVER['REQUEST_URI']);
+```
+
+
+#### Emulating the execution environment
+
+Certain APIs within PHP interact with the outside world. Some of these APIs cannot operate on Symbolic variables. One main example of this is the database API which is frequently used within web applications. Based on the observation that we cannot run queries with symbolic variables, we decided to abstract away the whole database. So all queries to the database now return a symbol. From time to time, we may identify a new API and its usage that we decide to model in our emulator.
+
+Another example of this is [PHP built-in functions](https://www.php.net/manual/en/indexes.functions.php). These functions are defined by the PHP engine itself, or added by PHP extensions. In AnimateDead, built-in functions are invoked natively with concrete values, but always return a Symbol whenever the function call arguments are symbolic. We also have the ability to hook into the built-in functions that change the state of the emulator. These hooks are called mocks. For instance, `define` API defines a new constant variable. As a result, instead of passing this call to the PHP engine, we add this constant to the symbol table inside our emulator by `define_mock` class.
+
+### Main modules of Extended-MalMax
+
+Now we briefly discuss the important modules within Extended-MalMax in order to understand their relationships.
+
+#### Entry point - PHPAnalyzer.php
+
+By instantiating the `PHPAnalyzer` class defined in `PHPAnalyzer.php`, we can start the emulation of PHP code. Before running this code, we need to setup its environment. For instance, we need to tell the emulator which variables, functions, and APIs are symbolic. `start($file)` function within PHPAnalyzer takes a PHP file as input and starts executing it. PHPAnalyzer itself hands the control to emulator.php and also extends the OOEmulator class.
+
+#### php-emul/emulator.php
+
+This class defines a start() method, which is the entry point to running new PHP files. The flow is "start($file) → run_file($file) → run_code($ast)". From here, run_code()" takes an AST, iterates over its Nodes and calls "run_statement($node) which is defined in `emulator-statements.php`.
+
+#### php-emul/emulator-statements.php
+
+As the name suggests, this "[trait](https://www.php.net/manual/en/language.oop5.traits.php)", which is added to the emulator itself, defines functions that deal with PHP statements. [Statements](https://github.com/nikic/PHP-Parser/tree/master/lib/PhpParser/Node/Stmt) are specific node types as defined by the PHP-Parser library. These are language constructs such as "If", "Class", "TryCatch", etc. Sometimes, in order to emulate the outcome of these statements, we need to evaluate expressions. Handling expressions is performed by `emulator-expression.php`.
+
+#### php-emul/emulator-expression.php
+
+[Expressions](https://github.com/nikic/PHP-Parser/tree/master/lib/PhpParser/Node/Expr) are a different type of node produced by the PHP-Parser. Expressions are the constructs that return something, in contrast, statements do not necessarily return a value after their execution. Some examples of PHP expressions are "and, or, cast, funcCall, etc." For instance, to decide the outcome of an "if statement", we need to evaluate the expression which is the condition of the if, and this is done by this file.
+
+The general structure of most of these files are similar. There is a giant if/else or switch/case statement, which checks the Node type of the current node on the AST and applies the corresponding logic to it.
+
+#### php-emul/emulator-functions.php
+
+For function call expressions, we hand the execution of the application to `emulator-functions.php` file. Resolving function arguments, the execution context and variable scopes and even resolving the function calls to their function body is performed here. Depending on the type of function call, we may end up calling different methods from this file. For instance, static calls or calls to built-in PHP functions are handled differently compared to normal function calls.
+
+#### php-emul/emulator-variables.php
+
+This file interfaces the variable operations with the _Symbol Table_ of the emulator. Setting or fetching variable values are some of the functions performed within this file. This file includes `SymbolicVariable.php` which adds the definition of SymbolicVariable type to Extended-MalMax.
+
+#### php-emul/emulator-errors.php
+
+This file is responsible for handling the active try/catch blocks and exception handling.
+
+#### php-emul/oo.php
+
+Object Oriented and class related operations such as "instantiating a new object" or "getting the parents of a class" and "calling class methods" are among the functions that are defined within this file.
+
+#### php-emul/oo-methods.php
+
+Similar to emulation-functions.php, this file handles method calls (functions that are defined within classes).
+
+#### php-emul/LineLogger.php
+
+Less is More uses XDebug to record line level code coverage and remove any unused file/function to debloat PHP applications \[[https://lessismore.debloating.com/](https://lessismore.debloating.com/)\]. In this project, we use a similar approach to collect our baseline code-coverage and web server logs, and then we use an emulator to extract the executable paths within an application based on entry points. Ultimately, we plan to use the line coverage produced by our concolic PHP emulator  to debloat the application. As a result, we include this module, which is called whenever a Node within the AST is being executed to log the starting and ending line numbers of each Node.
+
+#### mocks
+
+In order to hook into the execution of built-in functions of PHP, we defined mocks. Mocks should be named similar to the function they are trying to override (e.g., to override `array_key_exists` we define `array_key_exists_mock`. The parameters are an instance of the emulator (`$emul`) followed by the original parameters, as expected by the built-in functions. To add a mock for a new built-in function, we always refer to the PHP documents to extract these parameters. For instance, the parameters for `array_key_exists` are:
+
+`array_key_exists($emul, $key, $array)`: returns true if `$key` exists in the `$array` keys. Sometimes we perform an operation at the level of the emulator and then call the original built-in function, and sometimes we handle everything at the emulator itself.
+
+## AnimateDead
+
+This module parses the Apache access_log files and translates them to entry points and emulator states that Extended-MalMax can understand. Extended-MalMax is one of the dependencies of AnimateDead (included under vendor directory).
+
+Since the emulator is running as a CLI application, certain environment related variables and constants may return a different value compared to a PHP script that is invoked from Apache. In order to emulate an environment such that the web application under emulation thinks it is running by Apache, we override certain PHP constants. These constants are extracted from a running Apache instance and stored as a serialized file which is then loaded into the emulator.
+
+### constants.ser
+
+For older applications, we have to emulate a PHP 5.6 environment and for recent applications, we emulate a PHP 7.3 environment.
+
+### config.json
+
+This config file, defines the path to php.ini file, constants, include_path, server headers, and certain other configurations of the emulator. Things such as, the list of built-in functions that should return a symbolic value (e.g., mysql database APIs) or the list of variables that are symbolic based on request type (e.g., `$_COOKIE`, `$_SESSION`, `$_POST`, etc.)
+
+### Entry point - RaiseDead.php
+
+This is the entry point to AnimateDead. This file is invoked over CLI, and takes the path to access logs as input and starts emulating the PHP files from HTTP requests in the logs.
+
+`Usage: php RaiseDead.php -l access.log -e extended_logs.log -r application/root/dir -u uri_prefix [-i ip_addr -v verbosity --reanimationpid pid]`
+
+*   \-l or -e is used to defined the path to log file (-l for normal and -e for extended logs)
+    
+*   \-r is path to the target web application files on the local file system.
+    
+*   \-u is the path prefix to the root of of target application as used within the log files. For instance, if our WordPress is hosted under /wp5.1 directory, we need to provide this information to the emulator. This way /wp5.1/index.php can be translated to the correct file on the local file system.
+    
+*   \-i can be used to only focus on entries of a certain IP address from the log files.
+    
+*   \-v defines the verbosity of the printed messages while running the code, I believe it ranges from 0-10.
+    
+*   \--reanimationpid can be used to replay the execution of one of the paths within an application in a single thread. This is usually used in combination with breakpoints to debug and explore a specific emulation.
+    
+
+We have two types of log files, normal access logs and extended logs.
+
+### Access logs
+
+These logs are the default log file produced by the Apache web server. They only include the HTTP verb (GET, POST, etc.), the URI and the response code. They do not include cookies and post parameters.
+
+### Extended logs
+
+For some complex applications, emulation based on normal access logs means that we have to assume every POST parameter, COOKIE value and SESSION variable as Symbolic. This can quickly lead to a large number of paths that need to be explored. In order to make the analysis quicker, we introduced a notion of extended logs, which are produced by a small PHP module injected into the applications by PHP itself. These logs include the keys of defined POST, COOKIE, and SESSION variables. This way, if a key within these arrays were never defined, we can skip the exploration of those paths.
+
+### RaiseDead.php / DistributedRaiseDead.php
+
+In order to explore multiple paths within an application efficiently, we make use of multiple worker processes and a message queue. This file prepares our emulator for this scheme.
+
+### lib/AnimateDead/Utils.php 
+
+This file defines helper functions to parse and load config file.
+
+## Reanimation
+
+This feature is an implementation of forced execution in AnimateDead. Forced execution, essentially drives the execution path towards a certain branch. For instance, whenever the emulator reaches a Symbolic if condition, the current worker will explore on branch, and add a new "Reanimation Job" to the queue so that another worker can explore the other branch of that symbolic if condition. In order to do this, each execution within the emulator will produce a log of the branches that it takes, the next worker can take this "Reanimation log", and follow the execution to reach the same condition and then force the execution into the unexplored path.
+
+These logs are stored under "animate_dead/logs/reanimation_logs/\[task_id\]_reanimation_log.txt".
+
+## Distributed AnimateDead
+
+AnimateDead originally started as a single thread application. We then switched to multi-process execution using forking and in the current version, we are using multiple workers. This project (Distributed AnimateDead) defines the orchestrator and worker node types. Under distributed_animate_dead/php/client/ you will find these class definitions.
+
+### AnimateDeadWorker
+
+Defines the APIs that consume new emulation tasks from the queue and produce new tasks to explore the new symbolic paths discovered in the application. This node consumes from "WORKERS_QUEUE = `executions`" queue.
+
+### WraithOrchestrator(s) aka Master nodes
+
+Takes the reanimation jobs and termination information and assigns a priority to new jobs. This way, paths with higher priority will be explored first. Reanimation jobs and termination information is put onto the "MANAGER_QUEUE = `reanimations"` queue and new jobs are transferred to WORKERS_QUEUE.
+
+In the latest commit of this project, Master nodes are also run in a distributed fashion and use a Redis datastore to sync with each other. This helps add fresh reanimation tasks to the executions queue quicker.
+
+## Development and debugging environment
+
+### Mock classes
+
+Distributed AnimateDead runs with RabbitMQ, inside a distributed dockerized environment. While it improves the performance compared to single threaded execution, it makes debugging tasks more challenging. In order to replay an emulation in a single thread without the extra details of the message queue, we defined mock classes that abstract away the queue related details. By running `WraithOrchestrationNoMQ.php` file inside the IDE, which itself uses `AnimateDeadWorkerMock`, we can set breakpoints inside the emulator code and debug the emulation as needed.
+
+### Docker 
+
+Our setup uses Docker Compose to launch worker and queue related nodes. These nodes are defined within docker-compose.yml file.
+
+*   rabbitmq: Is our Queue system.
+    
+*   master: Runs our orchestrator nodes.
+    
+*   run: Is used to start an execution task. Now use this one instead of master.
+    
+*   worker: Runs AnimateDeadWorker. "replicas" variable defines how many workers we have. Depending on the number of CPUs, this number can be changes.
+    
+*   db: Hosts our mysql reporting database instance which records the execution information.
+    
+*   phpmyadmin: Provides the management API for our reporting database.
+    
+*   grafana: Provides a reporting dashboard to track the execution of tasks.
+    
+
+### Web Interfaces
+
+* Grafana [username=admin, password=admin]: [http://localhost:3000/d/h8X96w3Mk/executions?orgId=1](http://localhost:3000/d/h8X96w3Mk/executions?orgId=1) (Navigate to General/Executions Panel)
+* RabbitMQ Admin Interface [username=rabbitmq, password=7d9qghuwqh9d87hgq9w]: [http://localhost:15672/](http://localhost:15672/) (View workers, tasks on the queue, etc.)
+
+### Collecting the Coverage
+
+After running the emulator, each emulated path will create a line coverage log under `distributed_animate_dead/php/client/animate_dead/logs/`. You can use the script provided under `distributed_animate_dead/php/analysis/merge_coverage.php` to merge all the line coverage information into a single file. We usually contrast this coverage to the dynamic coverage produced by XDebug to identify the missed paths and bugs within the emulator.
+
+### Tests
+
+Unit tests are great. We always aim to create them for every new feature that we implement, and certain features, definitely need tests. AnimateDead defines tests under the "tests" directory. Each test class defines a TestCase which defines the success conditions of that test. This is performed using Asserts provided by the PHPUnit library. We typically check for the coverage of a specific line in the code or check for presence of a string in the produced output of the PHP script.
+
+Let's have a look at `test/ClassSelfTest.php`. This test runs `class_self.test.php` file and checks that the output contains "we should get here without errors" string. Now the `test/testcode/class_self.test.php` file includes the actual PHP code being emulated. Our goal in this test is to check the implementation of `self::property` structure within PHP and we borrow this class definition from phpMyAdmin. The path that successfully fetches `self::ERROR_READING` variable will print the output that makes the test succeed.
+
+Within PHPUnit, we have the ability to run all or a selected subset of tests. It is a good practice to create a test for every new feature that is implemented within Extended-MalMax. We can call PHPUnit from the CLI or invoke it from PHPStorm to run the tests.
+
+## Development Environment [XDebug / PHPStorm]
+
+Our suggested development environment for AnimateDead is PHPStorm, in combination with XDebug. PHPStorm provides a free educational license for students. XDebug itself is a PHP extension that can be installed using the OS package manager, PECL, or by manual compilation and installation: [https://xdebug.org/docs/install](https://xdebug.org/docs/install) .
+
+# Setting Up AnimateDead
+
+First step is to download and setup the project modules starting with Distributed AnimateDead:
+
+1.  Open the compressed `tar zxvf distributed_animate_dead.tar.gz`    
+
+Now you have all the code that is required to run the project.
+
+# Producing LIM logs and traces
+
+This document discusses the procedure to produce Less is More logs as baseline code coverage data and extended logs for AnimateDead. For most applications, AnimateDead can perform an effective emulated analysis based on default web server logs. For more complex applications such as phpMyAdmin, it is far more efficient to prepare extended logs for quicker and more precise analysis.
+
+## What are Extended logs and why do we use them?
+
+Extended logs are similar to web server logs in that they contain the entry point and request type information for user requests. Moreover, extended logs include the keys of symbolic variables (`$_POST`, `$_SESSION`, and `$_COOKIE`) and only the keys. The value of these elements are set to Symbolic. This helps AnimateDead to quickly rule out many of the Symbolic paths that require parameters that are absent from the logs. In the normal emulation mode with default web server logs, any arbitrary POST, SESSION, or COOKIE is set to symbolic, therefore, any path relying on the value of these variables would be covered.
+
+### LIM Logs
+
+Collect logs based on individual entry points with Less is More. Then export each entry point as PHP array in phpMyAdmin using the following query:
+
+```sql
+SELECT file_name, line_number 
+FROM covered_files
+JOIN covered_lines ON covered_lines.fk_file_id = covered_files.id
+JOIN tests ON covered_files.fk_test_id = tests.id
+WHERE test_group like '%index.php'
+```
+
+Repeat this for each entry point either based on extended logs or LIM admin panel. Update line 5 to match the entries in the `test_groups` of admin panel.
+
+### Extended Logs
+
+Configure web server to produce extended logs for each entry point. These logs are located under /var/www/html/logs.txt by default, and you need to manually split them by each entry point. Each entry is separated by `\n----\n.` This line separator is necessary even for logs with a single entry.
+
+The following php.ini configuration would enable both logging mechanisms:
+
+```
+[xdebug]
+...
+auto_prepend_file=/var/www/codecoverage/loader.php
+```
+
+# Running AnimateDead
+
+AnimateDead requires the source code of target applications for its analysis. The source code of our target web applications are stored under `php/debloating_templates/` and for the start, we can use "DVWA". Download its source from [anonymous] and unzip it.
+
+In order to run AnimateDead locally (Single thread, without Message Queue), which is mostly used for debugging purposes, you can run this command from `php/client/` directory:
+
+```
+docker compose exec run bash
+# Inside docker
+php WraithOrchestrator.php -l=../debloating_templates/apache_logs/DVWA_GET_login.log -r ../debloating_templates/DVWA/ -u /DVWA -i=172.24.0.1
+```
+
+You should see the logs being produced:
+
+```
+# Run to see logs
+docker compose logs worker
+```
+```
+Now processing GET to ../debloating_templates/DVWA/index.php
+--- 1 [710] ✔ 
+Now running /home/ubuntu/distributed_animate_dead/php/debloating_templates/DVWA/index.php...
+--- 2 [710] ✔ 
+Now running /home/ubuntu/distributed_animate_dead/php/debloating_templates/DVWA/dvwa/includes/dvwaPage.inc.php...
+--- 3 [710] ✔ 
+Now running /home/ubuntu/distributed_animate_dead/php/debloating_templates/DVWA/config/config.inc.php...
+--- 4 [710] ✔ 
+/home/ubuntu/distributed_animate_dead/php/debloating_templates/DVWA/config/config.inc.php finished.
+--- 5 [710] ✔ 
+Now running /home/ubuntu/distributed_animate_dead/php/debloating_templates/DVWA/dvwa/includes/dvwaPhpIds.inc.php...
+--- 6 [710] ✔ 
+Now running /home/ubuntu/distributed_animate_dead/php/debloating_templates/DVWA/external/phpids/0.6/lib/IDS/Init.php...
+--- 7 [710] ✔ 
+/home/ubuntu/distributed_animate_dead/php/debloating_templates/DVWA/external/phpids/0.6/lib/IDS/Init.php finished.
+--- 8 [710] ✔ 
+/home/ubuntu/distributed_animate_dead/php/debloating_templates/DVWA/dvwa/includes/dvwaPhpIds.inc.php finished.
+```
+
+### Checking the coverage
+
+If you navigate to `php/client/animate_dead/logs/` while running AnimateDead in debugging mode, you should see a file named `dummy_line_coverage_logs.txt` which includes the lines from DVWA that were explored during this analysis.
+
+If you are able to reproduce these results, it means that your AnimateDead setup is successful.
